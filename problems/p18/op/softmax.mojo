@@ -25,11 +25,58 @@ fn softmax_gpu_kernel[
     output: LayoutTensor[dtype, layout, MutAnyOrigin],
     input: LayoutTensor[dtype, layout, ImmutAnyOrigin],
 ):
-    # FILL IN (roughly 31 lines)
-    ...
+    # Implementation 1 (My original implementation)
+    # The bug I had was related to how I used the barrier in each loop for reduce operations
+    local_i = thread_idx.x
+    shared_sum = LayoutTensor[
+        dtype,
+        Layout.row_major(BLOCK_DIM_X),
+        MutAnyOrigin,
+        address_space = AddressSpace.SHARED,
+    ].stack_allocation()
+    shared_max = LayoutTensor[
+        dtype,
+        Layout.row_major(BLOCK_DIM_X),
+        MutAnyOrigin,
+        address_space = AddressSpace.SHARED,
+    ].stack_allocation()
+    var val: Scalar[dtype] = min_finite[dtype]()
+    if local_i < SIZE:
+        shared_max[local_i] = input[local_i]
+        val = rebind[Scalar[dtype]](input[local_i])
+    else:
+        shared_sum[local_i] = 0.0
+        shared_max[local_i] = 0.0
+    
+    # All threads have loaded the data in shared memory
+    barrier()
 
+    # all reduce to find the max
+    stride = UInt(BLOCK_DIM_X // 2)
+    while stride > 0:
+        if local_i < stride:
+            shared_max[local_i] = max(shared_max[local_i + stride], shared_max[local_i])
+            # Let threads finish before coalescing further
+        barrier()
+        stride = stride // 2
 
-# ANCHOR_END: softmax_gpu_kernel
+    var exp_val: Scalar[dtype] = 0.0
+    if local_i < SIZE:
+        exp_val = rebind[Scalar[dtype]](exp(val - shared_max[0]))
+    shared_sum[local_i] = exp_val
+    barrier()
+    
+    # all reduce to find the sum
+    stride = UInt(BLOCK_DIM_X // 2)
+    while stride > 0:
+        if local_i < stride:
+            shared_sum[local_i] += shared_sum[local_i + stride]
+            # Let threads finish before coalescing further
+        barrier()
+        stride = stride // 2
+
+    if local_i < SIZE:
+        output[local_i] = exp_val / shared_sum[0]
 
 
 # ANCHOR: softmax_cpu_kernel
@@ -41,9 +88,20 @@ fn softmax_cpu_kernel[
     output: LayoutTensor[dtype, layout, MutAnyOrigin],
     input: LayoutTensor[dtype, layout, ImmutAnyOrigin],
 ):
-    # FILL IN (roughly 10 lines)
-    ...
+    max_val = input[0]
+    for i in range(1, SIZE):
+        if input[i] > max_val:
+            max_val = input[i]
+    
+    var local_sum: output.element_type = 0
+    var exp_input = LayoutTensor[dtype, layout, MutAnyOrigin].stack_allocation()
+    for i in range(SIZE):
+        exp_input[i] = input[i] - max_val
+        exp_input[i] = exp(exp_input[i])
+        local_sum += exp_input[i]
 
+    for i in range(SIZE):
+        output[i] = exp_input[i] / local_sum
 
 # ANCHOR_END: softmax_cpu_kernel
 
