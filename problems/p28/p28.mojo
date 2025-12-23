@@ -47,7 +47,47 @@ fn async_copy_overlap_convolution[
         address_space = AddressSpace.SHARED,
     ].stack_allocation()
 
-    # FILL IN HERE (roughly 19 lines)
+    local_i = Int(thread_idx.x)
+
+    # Phase 1: Launch async copy for input tile
+    # Note: tile() does NOT perform bounds checking - ensure valid tile bounds
+    # Essentially this is just pointer arithmetic so load the current set of elements in a
+    # A single tile is essentially oriented using block level index since TPB == CONV_TILE_SIZE
+    input_tile = input.tile[CONV_TILE_SIZE](Int(block_idx.x))
+
+    # Use async copy with thread layout matching p14 pattern
+    comptime load_layout = Layout.row_major(THREADS_PER_BLOCK_ASYNC)
+    # This previously doesn't used to work on Apple GPUs but now it does
+    copy_dram_to_sram_async[thread_layout=load_layout](input_shared, input_tile)
+
+    # Phase 2: Load kernel synchronously (small data)
+    if local_i < KERNEL_SIZE:
+        kernel_shared[local_i] = kernel[local_i]
+
+    # Phase 3: Wait for async copy to complete
+    async_copy_wait_all()  # Always wait since we always do async copy
+    barrier()  # Sync all threads
+
+    # Phase 4: Compute convolution
+    # Typically we do global_i using block_dim.x but here we are using CONV_TILE_SIZE even though values are same in both
+    global_i = Int(block_idx.x) * CONV_TILE_SIZE + local_i
+    if local_i < CONV_TILE_SIZE and global_i < output.shape[0]():
+        var result: output.element_type = 0
+
+        # Simple convolution avoiding boundary issues
+        if local_i >= HALO_SIZE and local_i < CONV_TILE_SIZE - HALO_SIZE:
+            # Full convolution for center elements
+            for k in range(KERNEL_SIZE):
+                # TL;DR This is a centered offset convolution implementation not a left aligned one
+                # Apparently this is a common pattern in convolutional implementations
+                input_idx = local_i + k - HALO_SIZE
+                if input_idx >= 0 and input_idx < CONV_TILE_SIZE:
+                    result += input_shared[input_idx] * kernel_shared[k]
+        else:
+            # For boundary elements, just copy input (no convolution)
+            result = input_shared[local_i]
+
+        output[global_i] = result
 
 
 # ANCHOR_END: async_copy_overlap_convolution
