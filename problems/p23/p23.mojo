@@ -30,11 +30,71 @@ fn elementwise_add[
     fn add[
         simd_width: Int, rank: Int, alignment: Int = align_of[dtype]()
     ](indices: IndexList[rank]) capturing -> None:
-        idx = indices[0]
-        print("idx:", idx)
-        # FILL IN (2 to 4 lines)
+        #     GPU Architecture:
+        # ├── Grid (entire problem)
+        # │   ├── Block 1 (multiple warps)
+        # │   │   ├── Warp 1 (32 threads) --> We'll learn about Warp in the next Part VI
+        # │   │   │   ├── Thread 1 → SIMD[4 elements]  ← Our focus (GPU-dependent width)
+        # │   │   │   ├── Thread 2 → SIMD[4 elements]
+        # │   │   │   └── ...
+        # │   │   └── Warp 2 (32 threads)
+        # │   └── Block 2 (multiple warps)
+        
+        # Above is the key aspect where we are essentially saying each thread will process 4 elements
+        # We could used the standard approach of using thread/block indexing but we are moving to a higher level here
+        # Naive Implementation 1
+        # for i in range(simd_width):
+        #     idx = indices[0] + i
+        #     if idx < size:
+        #         output[idx] = a[idx] + b[idx]
+        
+        # Implementation 2, Vectorized
+        idx = indices[0]                                  # Linear index: 0, 4, 8, 12... (GPU-dependent spacing)
+        a_simd = a.aligned_load[simd_width](idx, 0)       # Load: [a[0:4], a[4:8], a[8:12]...] (4 elements per load)
+        b_simd = b.aligned_load[simd_width](idx, 0)       # Load: [b[0:4], b[4:8], b[8:12]...] (4 elements per load)
+        ret = a_simd + b_simd                             # SIMD: 4 additions in parallel (GPU-dependent)
+        output.aligned_store[simd_width](idx, 0, ret)     # Store: 4 results simultaneously (GPU-dependent)
 
-    elementwise[add, SIMD_WIDTH, target="gpu"](a.size(), ctx)
+        #  Traditional GPU:
+        # ├─ ALU 0: adds a[0] + b[0]
+        # ├─ ALU 1: adds a[1] + b[1]
+        # ├─ ALU 2: adds a[2] + b[2]
+        # └─ ALU 3: adds a[3] + b[3]
+        # (4 cores processing in parallel = 4 threads)
+
+        # SIMD-aware GPU:
+        # ├─ Vector ALU (256-bit): adds [a[0:4]] + [b[0:4]] simultaneously
+        # └─ Single vector register holds all 4 results
+        # (1 thread, 1 vector instruction, 4x throughput)
+        # Traditional CUDA (hand-written):
+        # int idx = blockIdx.x * blockDim.x + threadIdx.x;
+        # output[idx] = a[idx] + b[idx];  // Scalar code
+        # Compiler sees 32 scalar operations → generates:
+
+        # ld.f32   %f0, [a[idx]]          // load scalar
+        # ld.f32   %f1, [b[idx]]          // load scalar
+        # add.f32  %f2, %f0, %f1          // add scalar
+        # st.f32   [output[idx]], %f2     // store scalar
+        # (Repeated 32 times per warp)
+
+        # Mojo explicit SIMD:
+
+        # a_simd = a.aligned_load[4](idx, 0)  // Vector code
+        # ret = a_simd + b_simd
+        # output.aligned_store[4](idx, 0, ret)
+        # Compiler sees vector operations → generates:
+
+        # ld.v4.f32  %v0, [a[idx]]        // load 4-element vector (single instruction)
+        # ld.v4.f32  %v1, [b[idx]]        // load 4-element vector
+        # add.v4.f32 %v2, %v0, %v1        // add 4 elements (single instruction)
+        # st.v4.f32  [output[idx]], %v2   // store 4-element vector
+        # Both compile to CUDA/PTX, but:
+
+        # Traditional: Compiler must recognize pattern and auto-vectorize (often fails)
+        # Mojo explicit: Compiler sees vector ops directly → guaranteed vector instructions
+        # The real advantage: Mojo's explicit syntax forces the compiler to generate vector code, instead of hoping it auto-vectorizes. The backend is the same, but the generated instructions are better.
+
+    elementwise[add, SIMD_WIDTH, target="gpu"](size, ctx)
 
 
 # ANCHOR_END: elementwise_add
@@ -63,12 +123,35 @@ fn tiled_elementwise_add[
         simd_width: Int, rank: Int, alignment: Int = align_of[dtype]()
     ](indices: IndexList[rank]) capturing -> None:
         tile_id = indices[0]
-        print("tile_id:", tile_id)
         output_tile = output.tile[tile_size](tile_id)
+        # Each tile[size](id) creates a view into the original tensor
+        # Views are zero-copy - no data movement, just pointer arithmetic
         a_tile = a.tile[tile_size](tile_id)
         b_tile = b.tile[tile_size](tile_id)
+        # Naive Implementation 1
+        # ret = a_tile + b_tile
+        # for i in range(tile_size):
+        #     output_tile[i] = ret[i]
 
-        # FILL IN (6 lines at most)
+        # Implementation 2
+        # Cache optimization: Consecutive memory accesses maximize cache hit rates
+        # Compiler optimization: @parameter loops unroll completely at compile-time
+            # @parameter means the loop bounds are compile-time constants, so the compiler can completely unroll the loop.
+        # Memory bandwidth: Sequential access aligns with memory controller design
+        # Performance trade-offs:
+
+        # Fewer logical threads: May not fully utilize all GPU cores at low occupancy
+        # More work per thread: Better cache utilization and reduced coordination overhead
+        # Sequential access: Optimal memory bandwidth utilization within each thread
+        # Reduced overhead: Less thread launch and coordination overhead
+        # Important note: “Fewer threads” refers to the logical programming model. The GPU scheduler can still achieve high hardware utilization by running multiple warps and efficiently switching between them during memory stalls.
+        # https://puzzles.modular.com/puzzle_23/tile.html#6-performance-characteristics (This part is important to understand because of how trade offs are)
+        @parameter
+        for i in range(tile_size):
+            a_vec = a_tile.load[simd_width](i, 0)
+            b_vec = b_tile.load[simd_width](i, 0)
+            ret = a_vec + b_vec
+            output_tile.store[simd_width](i, 0, ret)
 
     num_tiles = (size + tile_size - 1) // tile_size
     elementwise[process_tiles, 1, target="gpu"](num_tiles, ctx)
@@ -101,12 +184,31 @@ fn manual_vectorized_tiled_elementwise_add[
         num_threads_per_tile: Int, rank: Int, alignment: Int = align_of[dtype]()
     ](indices: IndexList[rank]) capturing -> None:
         tile_id = indices[0]
-        print("tile_id:", tile_id)
         output_tile = output.tile[chunk_size](tile_id)
         a_tile = a.tile[chunk_size](tile_id)
         b_tile = b.tile[chunk_size](tile_id)
 
-        # FILL IN (7 lines at most)
+        # elemenwise_add
+        # idx = indices[0]                                  # Linear index: 0, 4, 8, 12... (GPU-dependent spacing)
+        # a_simd = a.aligned_load[simd_width](idx, 0)       # Load: [a[0:4], a[4:8], a[8:12]...] (4 elements per load)
+        # b_simd = b.aligned_load[simd_width](idx, 0)       # Load: [b[0:4], b[4:8], b[8:12]...] (4 elements per load)
+        # ret = a_simd + b_simd                             # SIMD: 4 additions in parallel (GPU-dependent)
+        # output.aligned_store[simd_width](idx, 0, ret)     # Store: 4 results simultaneously (GPU-dependent)
+
+        @parameter
+        for i in range(tile_size):
+            # aligned_load[simd_width](index, offset) loads multiple elements as a vector from a tensor.
+            # Parameters:
+            # simd_width: How many elements to load (4, 8, 16, etc.)
+            # index: Starting position in the tensor
+            # offset: Additional offset (usually 0)
+            global_start = tile_id * chunk_size + i * simd_width
+
+            a_vec = a.aligned_load[simd_width](global_start, 0)
+            b_vec = b.aligned_load[simd_width](global_start, 0)
+            ret = a_vec + b_vec
+
+            output.aligned_store[simd_width](global_start, 0, ret)
 
     # Number of tiles needed: each tile processes chunk_size elements
     num_tiles = (size + chunk_size - 1) // chunk_size
@@ -143,18 +245,23 @@ fn vectorize_within_tiles_elementwise_add[
         tile_start = tile_id * tile_size
         tile_end = min(tile_start + tile_size, size)
         actual_tile_size = tile_end - tile_start
-        print(
-            "tile_id:",
-            tile_id,
-            "tile_start:",
-            tile_start,
-            "tile_end:",
-            tile_end,
-            "actual_tile_size:",
-            actual_tile_size,
-        )
 
-        # FILL IN (9 lines at most)
+        fn vectorized_add[
+            width: Int
+        ](i: Int) unified {read tile_start, read a, read b, mut output}:
+            global_idx = tile_start + i
+            if global_idx + width <= size:
+                a_vec = a.aligned_load[width](global_idx, 0)
+                b_vec = b.aligned_load[width](global_idx, 0)
+                result = a_vec + b_vec
+                output.aligned_store[width](global_idx, 0, result)
+
+        # Use vectorize within each tile
+        # Essentially, the function runs actual tile size times with SIMD width.
+        # This approach is not very different from the tiled approach that we have covered, just with the use of vectorized function.  
+        vectorize[simd_width](actual_tile_size, vectorized_add)
+
+
 
     num_tiles = (size + tile_size - 1) // tile_size
     elementwise[
@@ -341,6 +448,7 @@ def main():
         elementwise_add[layout, dtype, SIMD_WIDTH, rank, SIZE](
             out_tensor, a_tensor, b_tensor, ctx
         )
+        ctx.synchronize()
 
         with out.map_to_host() as out_host:
             print("out:", out_host)

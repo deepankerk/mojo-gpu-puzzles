@@ -1,6 +1,6 @@
 from gpu import thread_idx, block_idx, block_dim, lane_id
 from gpu.host import DeviceContext
-from gpu.warp import shuffle_down, broadcast, WARP_SIZE
+from gpu.warp import shuffle_down, broadcast, sum as warp_sum, WARP_SIZE
 from layout import Layout, LayoutTensor
 from sys import argv
 from testing import assert_equal, assert_almost_equal
@@ -26,8 +26,17 @@ fn neighbor_difference[
     """
     global_i = Int(block_dim.x * block_idx.x + thread_idx.x)
     lane = Int(lane_id())
-
-    # FILL IN (roughly 7 lines)
+    current_val = input[global_i]
+    # Why send your current value?
+    # Because it's a collective operation. Every thread must send to participate. 
+    # Your value becomes what the thread "behind" you (lower index) receives.
+    # SIMT optimization: Single instruction processes all lanes simultaneously
+    # Register communication: Data moves between registers, not through memory hierarchy
+    next_val = shuffle_down(current_val, 1)
+    if global_i < size-1:
+        output[global_i] = next_val - current_val
+    else:
+        output[global_i] = 0
 
 
 # ANCHOR_END: neighbor_difference
@@ -52,8 +61,21 @@ fn moving_average_3[
     """
     global_i = Int(block_dim.x * block_idx.x + thread_idx.x)
     lane = Int(lane_id())
-
-    # FILL IN (roughly 10 lines)
+    current_val = input[global_i]
+    var next_1: input.element_type = 0
+    var next_2: input.element_type = 0
+    if global_i < size:
+        # shuffle is safe at warp boundaries
+        # no need to check anything explicitly
+        next_1 = shuffle_down(current_val, 1)
+        next_2 = shuffle_down(current_val, 2)
+    
+        if lane == WARP_SIZE-1:
+            output[global_i] = current_val
+        elif lane == WARP_SIZE-2:
+            output[global_i] = (current_val+next_1) / 2
+        else:
+            output[global_i] = (current_val+next_1+next_2) / 3
 
 
 # ANCHOR_END: moving_average_3
@@ -75,8 +97,21 @@ fn broadcast_shuffle_coordination[
     lane = Int(lane_id())
     if global_i < size:
         var scale_factor: output.element_type = 0.0
+        if lane == 0:
+            block_start = Int(block_idx.x * block_dim.x)
+            var sum: output.element_type = 0.0
+            for i in range(4):
+                if block_start + i < size:
+                    sum += input[block_start + i]
+            scale_factor = sum / 4.0
 
-        # FILL IN (roughly 14 lines)
+        scale_factor = broadcast(scale_factor)
+        next_val = shuffle_down(input[global_i], 1)
+        if global_i == size-1:
+            output[global_i] = scale_factor * input[global_i]
+        else:
+            output[global_i] = scale_factor * (next_val + input[global_i]) 
+    
 
 
 # ANCHOR_END: broadcast_shuffle_coordination
@@ -97,8 +132,20 @@ fn basic_broadcast[
     lane = Int(lane_id())
     if global_i < size:
         var broadcast_value: output.element_type = 0.0
-
-        # FILL IN (roughly 10 lines)
+        if lane < 4: 
+            broadcast_value = input[global_i]
+        # Another possible approach for calculating the broadcast value
+        # var broadcast_value: output.element_type = 0.0
+        # if lane == 0:
+        #     block_start = Int(block_idx.x * block_dim.x)
+        #     var sum: output.element_type = 0.0
+        #     for i in range(4):
+        #         if block_start + i < size:
+        #             sum += input[block_start + i]
+        #     broadcast_value = sum
+        
+        broadcast_value = broadcast(warp_sum(broadcast_value))
+        output[global_i] = broadcast_value + input[global_i]
 
 
 # ANCHOR_END: basic_broadcast
@@ -119,9 +166,16 @@ fn conditional_broadcast[
     lane = Int(lane_id())
     if global_i < size:
         var decision_value: output.element_type = 0.0
+        if lane == 0:
+            block_start = Int(block_idx.x * block_dim.x)
+            var max_val: output.element_type = 0.0
+            for i in range(8):
+                if block_start + i < size:
+                    max_val = max(input[block_start + i], max_val)
+            decision_value = max_val
 
-        # FILL IN (roughly 10 lines)
-
+        decision_value = broadcast(decision_value)
+        
         current_input = input[global_i]
         threshold = decision_value / 2.0
         if current_input >= threshold:

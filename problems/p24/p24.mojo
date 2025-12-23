@@ -80,7 +80,17 @@ fn simple_warp_dot_product[
     b: LayoutTensor[dtype, in_layout, ImmutAnyOrigin],
 ):
     global_i = Int(block_dim.x * block_idx.x + thread_idx.x)
-    # FILL IN (6 lines at most)
+    # Each thread computes one partial product using vectorized approach as values in Mojo are SIMD based
+    var partial_product: Scalar[dtype] = 0
+    if global_i < size:
+        partial_product = (a[global_i] * b[global_i]).reduce_add()
+
+    # warp_sum() replaces all the shared memory + barriers + tree reduction
+    total = warp_sum(partial_product)
+
+    # Only lane 0 writes the result (all lanes have the same total)
+    if lane_id() == 0:
+        output[global_i // WARP_SIZE] = total
 
 
 # ANCHOR_END: simple_warp_kernel
@@ -106,8 +116,36 @@ fn functional_warp_dot_product[
         simd_width: Int, rank: Int, alignment: Int = align_of[dtype]()
     ](indices: IndexList[rank]) capturing -> None:
         idx = indices[0]
-        print("idx:", idx)
-        # FILL IN (10 lines at most)
+        # Implementation 1
+        # var partial_product: Scalar[dtype] = 0.0
+        # if idx < size:
+        #     a_simd = a.aligned_load[simd_width](idx, 0)       # Load: [a[0:4], a[4:8], a[8:12]...] (4 elements per load)
+        #     b_simd = b.aligned_load[simd_width](idx, 0)       # Load: [b[0:4], b[4:8], b[8:12]...] (4 elements per load)
+        #     partial_product = (a_simd * b_simd).reduce_add()   # SIMD: 4 multiplications in parallel (GPU-dependent)
+        # else:
+        #     partial_product = 0.0                         # SIMD: 4 additions in parallel (GPU-dependent)
+        
+        # total = warp_sum(partial_product)
+
+        # if lane_id() == 0:
+        #     output[idx // WARP_SIZE] = total
+
+        #Implementation 2
+        # Each thread computes one partial product
+        var partial_product: Scalar[dtype] = 0.0
+        if idx < size:
+            a_val = a.load[1](idx, 0)
+            b_val = b.load[1](idx, 0)
+            partial_product = a_val * b_val
+        else:
+            partial_product = 0.0
+
+        # Warp magic - combines all WARP_SIZE partial products!
+        total = warp_sum(partial_product)
+
+        # Only lane 0 writes the result (all lanes have the same total)
+        if lane_id() == 0:
+            output.store[1](idx // WARP_SIZE, 0, total)
 
     # Launch exactly size == WARP_SIZE threads (one warp) to process all elements
     elementwise[compute_dot_product, 1, target="gpu"](size, ctx)

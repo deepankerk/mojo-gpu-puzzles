@@ -26,8 +26,9 @@ fn butterfly_pair_swap[
     This is the foundation of butterfly network communication patterns.
     """
     global_i = Int(block_dim.x * block_idx.x + thread_idx.x)
-
-    # FILL ME IN (4 lines)
+    current_val = input[global_i]
+    swapped_val = shuffle_xor(current_val, 1)  # XOR with 1 creates pairs
+    output[global_i] = swapped_val
 
 
 # ANCHOR_END: butterfly_pair_swap
@@ -48,8 +49,16 @@ fn butterfly_parallel_max[
     for any WARP_SIZE (32, 64, etc.).
     """
     global_i = Int(block_dim.x * block_idx.x + thread_idx.x)
+    if global_i < size:
+        max_val = input[global_i]  # Start with local value
 
-    # FILL ME IN (roughly 7 lines)
+    # Butterfly reduction tree: dynamic for any WARP_SIZE
+        offset = WARP_SIZE // 2
+        while offset > 0:
+            max_val = max(max_val, shuffle_xor(max_val, offset))
+            offset //= 2
+
+        output[global_i] = max_val  # All lanes have global maximum
 
 
 # ANCHOR_END: butterfly_parallel_max
@@ -79,6 +88,17 @@ fn butterfly_conditional_max[
     if global_i < size:
         current_val = input[global_i]
         min_val = current_val
+
+        offset = WARP_SIZE // 2
+        while offset > 0:
+            current_val = max(current_val, shuffle_xor(current_val, offset))
+            min_val = min(min_val, shuffle_xor(min_val, offset))
+            offset //= 2
+
+        if lane % 2 == 0:
+            output[global_i] = current_val
+        else:
+            output[global_i] = min_val
 
         # FILL ME IN (roughly 11 lines)
 
@@ -114,8 +134,11 @@ fn warp_inclusive_prefix_sum[
     For multi-warp scenarios, additional coordination would be needed.
     """
     global_i = Int(block_dim.x * block_idx.x + thread_idx.x)
-
-    # FILL ME IN (roughly 4 lines)
+    if global_i < size:
+        var current_val = rebind[Scalar[dtype]](input[global_i])
+        # This only works within the current warp (WARP_SIZE threads)
+        scan_result = prefix_sum[exclusive=False](current_val)
+        output[global_i] = scan_result
 
 
 # ANCHOR_END: warp_inclusive_prefix_sum
@@ -149,8 +172,27 @@ fn warp_partition[
 
     if global_i < size:
         current_val = input[global_i]
+        # Get the predicate for each element
+        predicate_left = Float32(1.0) if current_val < pivot else Float32(0.0)
+        predicate_right = Float32(1.0) if current_val >= pivot else Float32(0.0)
 
-        # FILL ME IN (roughly 13 lines)
+        # get the number of elements < pivot as prefix sum
+        warp_left_post = prefix_sum[exclusive=True](predicate_left)
+        warp_right_post = prefix_sum[exclusive=True](predicate_right)
+
+        warp_left_total = predicate_left
+        
+        # Essentially get the total number of elements less than pivot
+        offset = WARP_SIZE // 2
+        while offset > 0:
+            warp_left_total += shuffle_xor(warp_left_total, offset)
+            offset = offset // 2
+
+        # Set the output value
+        if current_val < pivot:
+            output[Int(warp_left_post)] = current_val
+        else:
+            output[Int(warp_left_total + warp_right_post)] = current_val
 
 
 # ANCHOR_END: warp_partition

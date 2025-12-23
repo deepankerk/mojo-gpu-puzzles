@@ -76,8 +76,11 @@ fn block_sum_dot_product[
 
     global_i = Int(block_dim.x * block_idx.x + thread_idx.x)
     local_i = thread_idx.x
-
-    # FILL IN (roughly 6 lines)
+    
+    my_partial = a[global_i] * b[global_i]
+    output[0] = block.sum[block_size=TPB, broadcast=False](my_partial)
+    if local_i == 0:
+        output[block_idx.x] = output[0]
 
 
 # ANCHOR_END: block_sum_dot_product
